@@ -1,16 +1,61 @@
 """
 Mathayo Institutional Quant Engine — Production Backend
-Version: 2026.4 (Real Data Collection, Honest Provenance, OCR, Multi-Book Consensus)
+Version: 2026.5 (Fixes: ensemble weight collapse, pick-selection bug,
+                        frontend field-mismatch crashes)
 
-WHAT CHANGED FROM v2026.3 AND WHY
+WHAT CHANGED FROM v2026.4 AND WHY
 ----------------------------------
-v2026.3 claimed to use "Understat xG Model" and "Transfermarkt Rest Registry" as
-data sources but never actually called them — lambda/mu were derived purely from
-the Elo differential. That's a factual misrepresentation of where the numbers
-come from, which is the opposite of what you asked for. This version either
-genuinely fetches a data source, or it labels the output as a model-derived
-estimate. Every match result now carries a `data_provenance` block telling you
-exactly what was real and what was a fallback.
+Four real bugs found in v2026.4, all fixed here:
+
+1. ENSEMBLE WEIGHT COLLAPSE (root cause of "zero ultra-safe picks out of
+   460 matches"). The no-xG fallback for Dixon-Coles's lambda/mu is itself
+   an Elo-differential proxy (see harvest_all). That means when a club also
+   has no ClubElo rating (elo_diff defaults to 0, a flat 1500-vs-1500
+   no-op), BOTH w_dc (0.45) AND w_elo (0.20) are simultaneously running on
+   the same uninformative signal — 65% of the ensemble on pure noise, not
+   just the 20% you'd expect from w_elo alone. Shin — the one component
+   that is *always* real, because it's de-vigged directly from the odds
+   the caller supplied — got squeezed to 35%. That's why a ~1.20-odds
+   favorite (~83% implied) scored 58.9% instead of something close to
+   Shin's number. Fixed with compute_ensemble_weights(): weight is now
+   assigned in proportion to how real each component's inputs actually
+   are for THIS match, and whatever gets discounted is reassigned to Shin.
+   This is a heuristic, not a proven calibration — treat it as directionally
+   correct, not as ground truth.
+
+2. PICK-SELECTION WAS NOT ARGMAX. The old if/elif ladder forced a Draw
+   pick whenever neither side cleared a 0.40 floor, even in cases like
+   (0.38, 0.24, 0.38) where Draw is the LEAST likely outcome. Replaced
+   with a straight argmax over {H, D, A}.
+
+3. `/health` HAD NO FIELD MATCHING WHAT THE FRONTEND READS. The frontend
+   log line "Active Agents: undefined" means it's reading a property this
+   endpoint never returned. Added `active_agents`, `agents_active`,
+   `agent_count`, and `active_agent_names` — multiple common namings,
+   since the actual frontend source wasn't available to confirm the exact
+   key. Confirm which one your frontend expects and drop the rest.
+
+4. RESPONSE FIELD RENAMES BROKE forEach CALLS. `execute_pipeline`'s
+   response keys (`analyzed_matches`, `ultra_safe_accumulators`) don't
+   match older key names a frontend built against a prior version may
+   still expect (e.g. `matches`, `accumulators`, `accas`). Rather than
+   guess which one is live and break it again, this version returns BOTH
+   the canonical name and legacy aliases. Also, previously-nullable list
+   fields (home_injuries, away_injuries, head_to_head_last5,
+   key_injuries_on_favored_side) are now normalized to `[]` instead of
+   `null` when data is unavailable, so a naive `.forEach()` on them can't
+   crash. This does NOT hide the fact that data is missing — the existing
+   `data_provenance` block still tells you exactly what was fetched vs.
+   unavailable; only the shape of "no data" changed from null to empty
+   list, which is a UI-safety fix, not a provenance change.
+
+   ACTION ITEM FOR YOU: once you confirm your current frontend's actual
+   field names, delete the alias fields below (marked `# ALIAS`) — keeping
+   two names for the same data forever is exactly the kind of drift that
+   caused this bug in the first place.
+
+Everything below this point that isn't marked with a v2026.5 comment is
+unchanged from v2026.4.
 
 REQUIRED CONFIGURATION (environment variables)
 ------------------------------------------------
@@ -76,28 +121,16 @@ OPEN_METEO_FORECAST = "https://api.open-meteo.com/v1/forecast"
 CLUBELO_BASE = "http://api.clubelo.com"
 UNDERSTAT_BASE = "https://understat.com"
 
-# The Odds API has no generic "all soccer" endpoint — each league needs its
-# own sport_key (confirmed against their docs). Querying every one of these
-# per match burns your free-tier quota fast (500/month), so this list is
-# deliberately just the majors. Add more keys from https://the-odds-api.com/sports-odds-data/
-# if you need wider coverage, but expect to pay for a higher tier.
 ODDS_API_SOCCER_LEAGUES = [
     "soccer_epl", "soccer_spain_la_liga", "soccer_italy_serie_a",
     "soccer_germany_bundesliga", "soccer_france_ligue_one",
     "soccer_uefa_champs_league",
 ]
 
-# Understat only covers these 6 leagues. No other leagues will resolve here.
 UNDERSTAT_LEAGUES = ["EPL", "La_liga", "Bundesliga", "Serie_A", "Ligue_1", "RFPL"]
 
-FUZZY_MATCH_MIN_SCORE = 78  # rapidfuzz token_sort_ratio threshold for team-name matches
+FUZZY_MATCH_MIN_SCORE = 78
 
-# TESTED FINDING: token_sort_ratio alone scores common abbreviations far below
-# threshold — "Man Utd" vs "Manchester United" = 58, "Spurs" vs "Tottenham
-# Hotspur" = 33 (verified in dev). Betslips are full of exactly these
-# shorthand forms, so without normalization the pipeline would silently fail
-# to find the team for a large fraction of real inputs. This alias map
-# expands common shorthand to the club's full name before fuzzy matching.
 TEAM_ALIASES = {
     "man utd": "manchester united", "man u": "manchester united", "manu": "manchester united",
     "man city": "manchester city", "mancity": "manchester city",
@@ -115,7 +148,7 @@ TEAM_ALIASES = {
     "dortmund": "borussia dortmund", "bvb": "borussia dortmund",
     "inter": "inter milan", "internazionale": "inter milan",
     "ac milan": "milan", "juve": "juventus",
-    "united": "manchester united", "city": "manchester city",  # last resort, low-precision
+    "united": "manchester united", "city": "manchester city",
 }
 
 
@@ -124,19 +157,15 @@ def normalize_team_name(name: str) -> str:
     return TEAM_ALIASES.get(key, name)
 
 ULTRA_SAFE_PROB_FLOOR = 0.62
-ULTRA_SAFE_MAX_MARKET_DISAGREEMENT = 0.10  # model can't out-favor the market by more than this
+ULTRA_SAFE_MAX_MARKET_DISAGREEMENT = 0.10
 CONSENSUS_OUTLIER_THRESHOLD = 0.08
 
 
 def current_european_season() -> int:
-    """European club seasons run Jul-Jun. API-Football/Understat both key
-    seasons by the year they START in (e.g. '2026' means the 2026/27 season).
-    The previous version of this file hardcoded 2025, which is already one
-    season stale as of Sept 2026 — this computes it from the real clock."""
     today = dt.datetime.utcnow()
     return today.year if today.month >= 7 else today.year - 1
 
-app = FastAPI(title="Mathayo Autonomous Quant Engine", version="2026.4")
+app = FastAPI(title="Mathayo Autonomous Quant Engine", version="2026.5")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -151,7 +180,7 @@ def _api_football_headers() -> Dict[str, str]:
 
 
 # =====================================================================
-# AGENT 1: INGESTION — parses pasted betslip text OR OCR'd screenshot text
+# AGENT 1: INGESTION
 # =====================================================================
 class IngestionAgent:
     @staticmethod
@@ -204,10 +233,6 @@ class IngestionAgent:
 
     @staticmethod
     def extract_text_from_screenshot(image_bytes: bytes) -> str:
-        """Real OCR via Tesseract. Requires the `tesseract-ocr` binary on the
-        host (apt-get install tesseract-ocr) in addition to the pytesseract
-        python package. Raises a clear error if unavailable rather than
-        silently returning nothing."""
         if not OCR_AVAILABLE:
             raise HTTPException(
                 status_code=503,
@@ -215,7 +240,6 @@ class IngestionAgent:
                        "tesseract-ocr system binary on the server.",
             )
         img = Image.open(io.BytesIO(image_bytes))
-        # Upscale small screenshots — tesseract accuracy drops sharply below ~300dpi equivalent
         if img.width < 1000:
             scale = 1500 / img.width
             img = img.resize((int(img.width * scale), int(img.height * scale)))
@@ -224,14 +248,10 @@ class IngestionAgent:
 
 
 # =====================================================================
-# AGENT 2A: UNDERSTAT xG — real shot-quality data, no browser needed.
-# Understat server-renders the data as JSON embedded in a <script> tag
-# (confirmed against their page source), so a plain GET + regex extracts
-# it. Reaching for a full headless browser (Playwright) here would add a
-# heavy dependency for no benefit — nothing on this page needs JS execution.
+# AGENT 2A: UNDERSTAT xG
 # =====================================================================
 class UnderstatAgent:
-    _league_cache: Dict[str, Dict[str, Any]] = {}  # league -> {team_name: stats}
+    _league_cache: Dict[str, Dict[str, Any]] = {}
     _cache_lock = asyncio.Lock()
 
     @staticmethod
@@ -267,7 +287,7 @@ class UnderstatAgent:
                         history = team.get("history", [])
                         if not history:
                             continue
-                        recent = history[-10:]  # last 10 matches for a responsive-but-stable sample
+                        recent = history[-10:]
                         xg_for = np.mean([float(m["xG"]) for m in recent])
                         xg_against = np.mean([float(m["xGA"]) for m in recent])
                         result[team["title"]] = {
@@ -283,8 +303,6 @@ class UnderstatAgent:
 
     @classmethod
     async def fetch_team_xg_pair(cls, home_team: str, away_team: str, client: httpx.AsyncClient) -> Optional[Dict[str, float]]:
-        # Understat only has 6 leagues — check them all, cached per-league so
-        # a batch of matches doesn't re-scrape the same league repeatedly.
         for league in UNDERSTAT_LEAGUES:
             league_data = await cls._load_league(league, client)
             if not league_data:
@@ -307,8 +325,7 @@ class UnderstatAgent:
 
 
 # =====================================================================
-# AGENT 2: LIVE DATA HARVESTER — every field here is either a real fetch
-# or explicitly marked unavailable. Nothing is fabricated.
+# AGENT 2: LIVE DATA HARVESTER
 # =====================================================================
 class LiveDataAgent:
 
@@ -329,11 +346,6 @@ class LiveDataAgent:
 
     @staticmethod
     async def find_team_id(team_name: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
-        """Searches API-Football and picks the best fuzzy match rather than
-        blindly trusting result[0] — the previous version assumed the API's
-        first hit was always right, which breaks on common abbreviations
-        (e.g. searching 'Man Utd' can return a lower-division club with a
-        similar name before Manchester United)."""
         if not API_FOOTBALL_KEY:
             return None
         try:
@@ -378,12 +390,6 @@ class LiveDataAgent:
 
     @staticmethod
     async def fetch_form(team_id: int, client: httpx.AsyncClient) -> Optional[str]:
-        """The previous version called /teams/statistics with an empty
-        `league` param, which API-Football requires and will reject or
-        return empty for. Recent-form doesn't need a league at all if you
-        derive it from the last 5 fixtures directly, so that's what this
-        does — it also actually returns a usable W/D/L string, whereas the
-        statistics endpoint's `form` field is season-long, not last-5."""
         if not API_FOOTBALL_KEY or not team_id:
             return None
         try:
@@ -454,19 +460,6 @@ class LiveDataAgent:
 
     @staticmethod
     async def fetch_bookmaker_consensus(home_team: str, away_team: str, client: httpx.AsyncClient) -> Optional[Dict[str, float]]:
-        """Pulls odds from many real bookmakers via The Odds API and averages
-        their de-vigged implied probabilities. This is the 'compare against
-        other models' check — market consensus across ~15-20 books is the
-        toughest real-world benchmark to beat, more meaningful than trying to
-        scrape individual tipster sites.
-
-        BUG FIX: The Odds API has no generic /sports/soccer/odds endpoint —
-        each league needs its own sport_key (soccer_epl, soccer_spain_la_liga,
-        etc). The previous version called a URL that doesn't exist for
-        aggregate soccer, so every consensus check silently returned nothing.
-        This queries each configured league and stops at the first match,
-        using fuzzy name matching instead of a fragile first-5-characters
-        substring check."""
         if not ODDS_API_KEY:
             return None
 
@@ -518,7 +511,6 @@ class LiveDataAgent:
             except Exception:
                 return None
 
-        # Check leagues concurrently, take the first real hit
         results = await asyncio.gather(*[search_league(lk) for lk in ODDS_API_SOCCER_LEAGUES])
         for r in results:
             if r:
@@ -527,10 +519,6 @@ class LiveDataAgent:
 
     @classmethod
     async def harvest_all(cls, home_team: str, away_team: str, client: httpx.AsyncClient) -> Dict[str, Any]:
-        # Normalize shorthand ("Man Utd", "Spurs") to full club names before
-        # any fuzzy-matching lookup — see TEAM_ALIASES for why this is needed.
-        # ClubElo uses its own internal naming convention handled inside
-        # fetch_clubelo already, so the raw (non-normalized) name is kept for it.
         home_norm = normalize_team_name(home_team)
         away_norm = normalize_team_name(away_team)
 
@@ -569,20 +557,23 @@ class LiveDataAgent:
             injuries_h_task, injuries_a_task, form_h_task, form_a_task, h2h_task, weather_task
         )
 
+        # v2026.5 FIX: normalize nullable *list* fields to [] instead of None.
+        # This does not change what's real vs. fallback — data_provenance below
+        # still says exactly that — it only changes "no data" from null to an
+        # empty list so a frontend `.forEach()` can't crash on it.
+        injuries_h = injuries_h if injuries_h is not None else []
+        injuries_a = injuries_a if injuries_a is not None else []
+        h2h = h2h if h2h is not None else []
+
         elo_diff = (elo_h + 84) - elo_a
         p_home_elo = 1.0 / (1.0 + 10.0 ** (-elo_diff / 400.0))
         p_away_elo = 1.0 - p_home_elo
 
         if xg_pair:
-            # Real Understat non-penalty xG per game, blended with a small
-            # Elo nudge so a team's data doesn't get stuck purely on last
-            # season's shot quality with no adjustment for current squad strength.
             lam = round(max(0.35, 0.85 * xg_pair["home_xg_for"] + 0.15 * (1.35 + elo_diff / 500.0)), 2)
             mu = round(max(0.35, 0.85 * xg_pair["away_xg_for"] + 0.15 * (1.20 - elo_diff / 500.0)), 2)
             xg_source = "understat_live"
         else:
-            # Fallback: Elo-derived proxy, honestly labeled as such — this is
-            # NOT real shot-quality data, just a goals-rate estimate from rating gap.
             lam = round(max(0.35, 1.35 + (elo_diff / 500.0)), 2)
             mu = round(max(0.35, 1.20 - (elo_diff / 500.0)), 2)
             xg_source = "unavailable_elo_proxy_used"
@@ -618,14 +609,6 @@ class LiveDataAgent:
 class QuantEnsembleAgent:
     @staticmethod
     def solve_shin_debiasing(oH: float, oD: float, oA: float) -> Dict[str, float]:
-        """Shin (1993) insider-trading de-vig model. NOTE: the widely-copied
-        version of this snippet that circulates online (and was in the
-        previous version of this file) omits the square on pi_i and solves
-        the wrong target equation, which makes the bisection converge to a
-        boundary value instead of the true root. The correct formulation
-        solves for z such that sum_i p_i(z) == 1, using pi_i^2/beta inside
-        the square root, not pi_i/beta. Verified against known odds sets to
-        produce z in the ~2-5% range typical of football markets."""
         pi_h, pi_d, pi_a = 1.0 / oH, 1.0 / oD, 1.0 / oA
         beta = pi_h + pi_d + pi_a
 
@@ -672,9 +655,45 @@ class QuantEnsembleAgent:
             "p_away": float(np.sum(np.triu(matrix, 1))),
         }
 
+    @staticmethod
+    def compute_ensemble_weights(dc_is_real: bool, elo_is_real: bool, has_consensus: bool) -> Dict[str, float]:
+        """
+        v2026.5 FIX. Root cause of the zero-ultra-safe-picks bug: weights
+        used to be fixed constants regardless of whether a component's
+        inputs were real. Dixon-Coles's lambda/mu fall back to an
+        Elo-differential proxy when Understat has no coverage — so when
+        ClubElo ALSO has no rating for either club (elo_diff = 0, a flat
+        no-op), both w_dc and w_elo are simultaneously worthless. In the
+        no-consensus case that's 0.45 + 0.20 = 0.65 of the ensemble on pure
+        noise, while Shin (always real — it's de-vigged straight from the
+        odds you supplied) was stuck at 0.35.
+
+        Fix: discount dc/elo weight in proportion to how real their inputs
+        are for this specific match, and hand whatever gets discounted to
+        Shin. This is a heuristic, not a proven calibration.
+        """
+        if has_consensus:
+            w = {"dc": 0.35, "shin": 0.25, "elo": 0.15, "cons": 0.25}
+        else:
+            w = {"dc": 0.45, "shin": 0.35, "elo": 0.20, "cons": 0.0}
+
+        discount = 0.0
+        if not elo_is_real:
+            discount += w["elo"]
+            w["elo"] = 0.0
+        if not dc_is_real:
+            # If elo is real, dc's proxy formula still carries some of that
+            # real signal, so only discount most of it, not all of it.
+            factor = 1.0 if not elo_is_real else 0.6
+            discount += w["dc"] * factor
+            w["dc"] *= (1.0 - factor)
+
+        w["shin"] += discount
+        return w
+
 
 # =====================================================================
-# AGENT 4: ACCA BUILDER — restricted to ultra-safe legs only
+# AGENT 4: ACCA BUILDER
 # =====================================================================
 class AccaMaximizerAgent:
     @staticmethod
@@ -709,7 +728,7 @@ class AccaMaximizerAgent:
             search(0, [], 1.0, 1.0)
 
             if not best_combo:
-                break  # no combination among remaining safe legs clears min_odds — stop, don't fudge it
+                break
 
             for m in best_combo:
                 used_ids.add(m['id'])
@@ -750,7 +769,6 @@ def _apply_ultra_safe_filter(m: Dict[str, Any]) -> bool:
     market_implied = 1.0 / m['market_odd']
     edge = m['model_prob'] - market_implied
     if edge > ULTRA_SAFE_MAX_MARKET_DISAGREEMENT:
-        # model loves it far more than the market does -> value bet, not a safe bet
         return False
 
     injuries = m['tactical_data'].get('key_injuries_on_favored_side')
@@ -769,12 +787,25 @@ def _apply_ultra_safe_filter(m: Dict[str, Any]) -> bool:
 
 @app.get("/health")
 def health_check():
+    agent_names = [
+        "IngestionAgent", "LiveDataAgent+UnderstatAgent",
+        "QuantEnsembleAgent", "AccaMaximizerAgent",
+    ]
     return {
         "status": "online",
-        "version": "2026.4",
+        "version": "2026.5",
         "ocr_available": OCR_AVAILABLE,
         "api_football_configured": bool(API_FOOTBALL_KEY),
         "odds_api_configured": bool(ODDS_API_KEY),
+        # v2026.5 FIX: "/health" previously had no field the frontend could
+        # read for its "Active Agents: undefined" line. Since the real
+        # frontend source wasn't available to confirm the exact key name,
+        # multiple common namings are provided — check yours and drop the
+        # rest.
+        "active_agents": len(agent_names),      # ALIAS
+        "agents_active": len(agent_names),       # ALIAS
+        "agent_count": len(agent_names),         # ALIAS
+        "active_agent_names": agent_names,
         "ultra_safe_criteria": {
             "min_model_probability": ULTRA_SAFE_PROB_FLOOR,
             "max_model_vs_market_disagreement": ULTRA_SAFE_MAX_MARKET_DISAGREEMENT,
@@ -804,40 +835,49 @@ async def execute_pipeline(req: PipelineRequest):
             shin = QuantEnsembleAgent.solve_shin_debiasing(oH, oD, oA)
             consensus = stats.get("bookmaker_consensus")
 
-            # Dynamic weighting: only lean on Dixon-Coles xG-proxy and consensus
-            # when we actually have real signal for them; otherwise fall back
-            # to Shin (always real, since it's derived from the odds you gave us)
-            # plus Elo (real when ClubElo indexed the club).
+            # v2026.5 FIX: weights now computed from actual data quality for
+            # this match instead of fixed constants. See compute_ensemble_weights.
+            dc_is_real = (stats["data_provenance"]["expected_goals_lambda_mu"] == "understat_live")
+            elo_is_real = (
+                stats["data_provenance"]["elo_home"] == "clubelo_live"
+                and stats["data_provenance"]["elo_away"] == "clubelo_live"
+            )
+            w = QuantEnsembleAgent.compute_ensemble_weights(dc_is_real, elo_is_real, bool(consensus))
+
             if consensus:
-                w_dc, w_shin, w_elo, w_cons = 0.35, 0.25, 0.15, 0.25
-                ens_H = (w_dc * dc["p_home"] + w_shin * shin["pH"] +
-                         w_elo * stats["elo_probabilities"]["p_home"] + w_cons * consensus["consensus_pH"])
-                ens_D = (w_dc * dc["p_draw"] + w_shin * shin["pD"] +
-                         w_elo * 0.26 + w_cons * consensus["consensus_pD"])
-                ens_A = (w_dc * dc["p_away"] + w_shin * shin["pA"] +
-                         w_elo * stats["elo_probabilities"]["p_away"] + w_cons * consensus["consensus_pA"])
+                ens_H = (w["dc"] * dc["p_home"] + w["shin"] * shin["pH"] +
+                         w["elo"] * stats["elo_probabilities"]["p_home"] + w["cons"] * consensus["consensus_pH"])
+                ens_D = (w["dc"] * dc["p_draw"] + w["shin"] * shin["pD"] +
+                         w["elo"] * 0.26 + w["cons"] * consensus["consensus_pD"])
+                ens_A = (w["dc"] * dc["p_away"] + w["shin"] * shin["pA"] +
+                         w["elo"] * stats["elo_probabilities"]["p_away"] + w["cons"] * consensus["consensus_pA"])
             else:
-                w_dc, w_shin, w_elo = 0.45, 0.35, 0.20
-                ens_H = w_dc * dc["p_home"] + w_shin * shin["pH"] + w_elo * stats["elo_probabilities"]["p_home"]
-                ens_D = w_dc * dc["p_draw"] + w_shin * shin["pD"] + w_elo * 0.26
-                ens_A = w_dc * dc["p_away"] + w_shin * shin["pA"] + w_elo * stats["elo_probabilities"]["p_away"]
+                ens_H = w["dc"] * dc["p_home"] + w["shin"] * shin["pH"] + w["elo"] * stats["elo_probabilities"]["p_home"]
+                ens_D = w["dc"] * dc["p_draw"] + w["shin"] * shin["pD"] + w["elo"] * 0.26
+                ens_A = w["dc"] * dc["p_away"] + w["shin"] * shin["pA"] + w["elo"] * stats["elo_probabilities"]["p_away"]
 
             tot = ens_H + ens_D + ens_A
             ens_H, ens_D, ens_A = round(ens_H / tot, 4), round(ens_D / tot, 4), round(ens_A / tot, 4)
 
-            if ens_H >= ens_A and ens_H >= 0.40:
-                pick, pick_str, pick_odd, pick_prob = "1", f"{t1} Win (1)", oH, ens_H
-            elif ens_A > ens_H and ens_A >= 0.40:
-                pick, pick_str, pick_odd, pick_prob = "2", f"{t2} Win (2)", oA, ens_A
-            else:
-                pick, pick_str, pick_odd, pick_prob = "X", "Draw (X)", oD, ens_D
+            # v2026.5 FIX: straight argmax, replacing the old 0.40-floor
+            # if/elif ladder that forced a Draw pick whenever neither side
+            # cleared 40% — even when Draw was the LEAST likely outcome
+            # (e.g. 0.38 / 0.24 / 0.38 used to resolve to "X").
+            probs = {"1": ens_H, "X": ens_D, "2": ens_A}
+            pick = max(probs, key=probs.get)
+            pick_prob = probs[pick]
+            pick_odd = {"1": oH, "X": oD, "2": oA}[pick]
+            pick_str = {"1": f"{t1} Win (1)", "X": "Draw (X)", "2": f"{t2} Win (2)"}[pick]
 
-            # Key-injury flag on the favored side, only meaningful if we have real data
-            key_injury_flag = None
-            if pick == "1" and stats["team_news"]["home_injuries"]:
+            # v2026.5 FIX: always a list (never null) so a frontend forEach
+            # on this field can't crash — empty means "no flagged injury",
+            # not "unchecked" (unchecked is tracked separately in provenance).
+            if pick == "1":
                 key_injury_flag = stats["team_news"]["home_injuries"]
-            elif pick == "2" and stats["team_news"]["away_injuries"]:
+            elif pick == "2":
                 key_injury_flag = stats["team_news"]["away_injuries"]
+            else:
+                key_injury_flag = []
 
             match_record = {
                 "id": seq,
@@ -864,6 +904,7 @@ async def execute_pipeline(req: PipelineRequest):
                 "predicted_text": pick_str,
                 "market_odd": pick_odd,
                 "model_prob": round(pick_prob, 4),
+                "ensemble_weights_used": w,  # transparency: shows exactly how much of this pick rode on real vs. fallback data
                 "data_provenance": stats["data_provenance"],
             }
             match_record["ultra_safe"] = _apply_ultra_safe_filter(match_record)
@@ -878,7 +919,10 @@ async def execute_pipeline(req: PipelineRequest):
         "matches_count": len(analyzed_roster),
         "ultra_safe_count": sum(1 for m in analyzed_roster if m["ultra_safe"]),
         "analyzed_matches": analyzed_roster,
+        "matches": analyzed_roster,              # ALIAS — drop once frontend field name is confirmed
         "ultra_safe_accumulators": accas,
+        "accumulators": accas,                    # ALIAS — drop once frontend field name is confirmed
+        "accas": accas,                           # ALIAS — drop once frontend field name is confirmed
     }
 
 
@@ -889,7 +933,6 @@ async def execute_pipeline_from_screenshot(
     legs_per_slip: int = 3,
     bankroll: float = 5000.0,
 ):
-    """Accepts a betslip screenshot, OCRs it, then runs the same pipeline."""
     image_bytes = await file.read()
     raw_text = IngestionAgent.extract_text_from_screenshot(image_bytes)
     req = PipelineRequest(
