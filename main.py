@@ -564,6 +564,14 @@ class LiveDataAgent:
         injuries_h = injuries_h if injuries_h is not None else []
         injuries_a = injuries_a if injuries_a is not None else []
         h2h = h2h if h2h is not None else []
+        # v2026.5.1 FIX: same treatment for nullable *object*-shaped fields —
+        # {} instead of null, so `Object.keys(match.weather)` or similar
+        # can't crash either. Still distinguishable from "checked, has data"
+        # via data_provenance, same as the list fields above.
+        weather = weather if weather is not None else {}
+        consensus = consensus if consensus is not None else {}
+        form_h = form_h if form_h is not None else ""
+        form_a = form_a if form_a is not None else ""
 
         elo_diff = (elo_h + 84) - elo_a
         p_home_elo = 1.0 / (1.0 + 10.0 ** (-elo_diff / 400.0))
@@ -745,6 +753,7 @@ class AccaMaximizerAgent:
                 "legs": best_combo,
                 "combined_odds": round(c_odds, 2),
                 "combined_prob_pct": round(c_prob * 100, 1),
+                "combined_prob": round(c_prob * 100, 1),  # ALIAS — matches frontend's s.combined_prob
                 "recommended_stake": stake,
                 "note": "Built only from legs meeting the ultra-safe filter (see /health for criteria).",
             })
@@ -889,6 +898,8 @@ async def execute_pipeline(req: PipelineRequest):
                 "tactical_data": {
                     "lambda_expected_goals_home": stats["lambda_home"],
                     "mu_expected_goals_away": stats["mu_away"],
+                    "lambda_xg": stats["lambda_home"],   # ALIAS — matches frontend's m.tactical_data.lambda_xg
+                    "mu_xg": stats["mu_away"],           # ALIAS — matches frontend's m.tactical_data.mu_xg
                     "elo_home": stats["elo_ratings"]["home"],
                     "elo_away": stats["elo_ratings"]["away"],
                     "elo_diff": stats["elo_diff"],
@@ -919,10 +930,11 @@ async def execute_pipeline(req: PipelineRequest):
         "matches_count": len(analyzed_roster),
         "ultra_safe_count": sum(1 for m in analyzed_roster if m["ultra_safe"]),
         "analyzed_matches": analyzed_roster,
-        "matches": analyzed_roster,              # ALIAS — drop once frontend field name is confirmed
+        "matches": analyzed_roster,              # ALIAS
         "ultra_safe_accumulators": accas,
-        "accumulators": accas,                    # ALIAS — drop once frontend field name is confirmed
-        "accas": accas,                           # ALIAS — drop once frontend field name is confirmed
+        "orthogonal_accumulators": accas,         # FIX — this is the exact key index.html reads; its absence was the forEach crash
+        "accumulators": accas,                    # ALIAS
+        "accas": accas,                           # ALIAS
     }
 
 
