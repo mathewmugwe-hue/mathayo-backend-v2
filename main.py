@@ -2,11 +2,11 @@
 Mathayo Institutional Quant Engine — Production Backend
 Version: 2026.5 (Fixes: ensemble weight collapse, pick-selection bug,
                         frontend field-mismatch crashes)
-
+ 
 WHAT CHANGED FROM v2026.4 AND WHY
 ----------------------------------
 Four real bugs found in v2026.4, all fixed here:
-
+ 
 1. ENSEMBLE WEIGHT COLLAPSE (root cause of "zero ultra-safe picks out of
    460 matches"). The no-xG fallback for Dixon-Coles's lambda/mu is itself
    an Elo-differential proxy (see harvest_all). That means when a club also
@@ -22,19 +22,19 @@ Four real bugs found in v2026.4, all fixed here:
    are for THIS match, and whatever gets discounted is reassigned to Shin.
    This is a heuristic, not a proven calibration — treat it as directionally
    correct, not as ground truth.
-
+ 
 2. PICK-SELECTION WAS NOT ARGMAX. The old if/elif ladder forced a Draw
    pick whenever neither side cleared a 0.40 floor, even in cases like
    (0.38, 0.24, 0.38) where Draw is the LEAST likely outcome. Replaced
    with a straight argmax over {H, D, A}.
-
+ 
 3. `/health` HAD NO FIELD MATCHING WHAT THE FRONTEND READS. The frontend
    log line "Active Agents: undefined" means it's reading a property this
    endpoint never returned. Added `active_agents`, `agents_active`,
    `agent_count`, and `active_agent_names` — multiple common namings,
    since the actual frontend source wasn't available to confirm the exact
    key. Confirm which one your frontend expects and drop the rest.
-
+ 
 4. RESPONSE FIELD RENAMES BROKE forEach CALLS. `execute_pipeline`'s
    response keys (`analyzed_matches`, `ultra_safe_accumulators`) don't
    match older key names a frontend built against a prior version may
@@ -48,15 +48,15 @@ Four real bugs found in v2026.4, all fixed here:
    `data_provenance` block still tells you exactly what was fetched vs.
    unavailable; only the shape of "no data" changed from null to empty
    list, which is a UI-safety fix, not a provenance change.
-
+ 
    ACTION ITEM FOR YOU: once you confirm your current frontend's actual
    field names, delete the alias fields below (marked `# ALIAS`) — keeping
    two names for the same data forever is exactly the kind of drift that
    caused this bug in the first place.
-
+ 
 Everything below this point that isn't marked with a v2026.5 comment is
 unchanged from v2026.4.
-
+ 
 REQUIRED CONFIGURATION (environment variables)
 ------------------------------------------------
 API_FOOTBALL_KEY   - from https://www.api-football.com (free tier: 100 req/day).
@@ -70,7 +70,7 @@ ODDS_API_KEY       - from https://the-odds-api.com (free tier: 500 req/month).
                      it, consensus checks are skipped and marked unavailable.
 No key is needed for weather (Open-Meteo is free/keyless) or for Elo
 (ClubElo is free/keyless).
-
+ 
 WHAT "ULTRA-SAFE" MEANS HERE
 ------------------------------
 A leg only qualifies for an accumulator if ALL of the following hold:
@@ -85,7 +85,7 @@ A leg only qualifies for an accumulator if ALL of the following hold:
 This is a heuristic, not a guarantee — no model eliminates variance in
 football. Treat "ultra-safe" as "lowest-variance available", not "certain".
 """
-
+ 
 import os
 import re
 import io
@@ -93,7 +93,7 @@ import json
 import asyncio
 import datetime as dt
 from typing import List, Dict, Any, Optional
-
+ 
 import numpy as np
 from scipy.stats import poisson
 import httpx
@@ -102,14 +102,14 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-
+ 
 try:
     import pytesseract
     from PIL import Image
     OCR_AVAILABLE = True
 except ImportError:
     OCR_AVAILABLE = False
-
+ 
 # =====================================================================
 # CONFIG
 # =====================================================================
@@ -120,17 +120,17 @@ ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 OPEN_METEO_FORECAST = "https://api.open-meteo.com/v1/forecast"
 CLUBELO_BASE = "http://api.clubelo.com"
 UNDERSTAT_BASE = "https://understat.com"
-
+ 
 ODDS_API_SOCCER_LEAGUES = [
     "soccer_epl", "soccer_spain_la_liga", "soccer_italy_serie_a",
     "soccer_germany_bundesliga", "soccer_france_ligue_one",
     "soccer_uefa_champs_league",
 ]
-
+ 
 UNDERSTAT_LEAGUES = ["EPL", "La_liga", "Bundesliga", "Serie_A", "Ligue_1", "RFPL"]
-
+ 
 FUZZY_MATCH_MIN_SCORE = 78
-
+ 
 TEAM_ALIASES = {
     "man utd": "manchester united", "man u": "manchester united", "manu": "manchester united",
     "man city": "manchester city", "mancity": "manchester city",
@@ -150,21 +150,21 @@ TEAM_ALIASES = {
     "ac milan": "milan", "juve": "juventus",
     "united": "manchester united", "city": "manchester city",
 }
-
-
+ 
+ 
 def normalize_team_name(name: str) -> str:
     key = re.sub(r'[^a-z0-9 ]', '', name.lower()).strip()
     return TEAM_ALIASES.get(key, name)
-
+ 
 ULTRA_SAFE_PROB_FLOOR = 0.62
 ULTRA_SAFE_MAX_MARKET_DISAGREEMENT = 0.10
 CONSENSUS_OUTLIER_THRESHOLD = 0.08
-
-
+ 
+ 
 def current_european_season() -> int:
     today = dt.datetime.utcnow()
     return today.year if today.month >= 7 else today.year - 1
-
+ 
 app = FastAPI(title="Mathayo Autonomous Quant Engine", version="2026.5")
 app.add_middleware(
     CORSMiddleware,
@@ -173,20 +173,86 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
+ 
+ 
 def _api_football_headers() -> Dict[str, str]:
     return {"x-apisports-key": API_FOOTBALL_KEY}
-
-
+ 
+ 
 # =====================================================================
 # AGENT 1: INGESTION
 # =====================================================================
 class IngestionAgent:
+    """
+    v2026.6 REWRITE. The old single-heuristic parser assumed one input shape:
+    team name / team name / odds / odds / odds, each alone on its own line.
+    That's a plain betslip paste. It is NOT what odibets' own site produces
+    when you copy a search-results tile, a league table view, or a full
+    match-detail page — and feeding those into the old heuristic is exactly
+    what produced fixtures like "Way vs Real Madrid" and "or X vs X or 2".
+    Those aren't hallucinated predictions; nothing downstream invents data.
+    "Way" and "or X" are literal text fragments from a "3 Way" market header
+    and "1 or X" Double-Chance labels elsewhere in the page dump, which the
+    old parser mistook for team names because they're short strings with
+    letters in them and nothing filtered them out.
+ 
+    Fix: detect which of the known real-world paste formats the text matches
+    and route to a parser built for that specific structure, instead of one
+    heuristic trying to cover all of them. Four formats are supported:
+      - "detail_dump": full match-detail page dump (has "ID: <n>" headers and
+        an exact "Draw" line inside the "3 Way" market block)
+      - "card": search-tile format with markdown-link team names and a single
+        glued odds line like "1 6.40X 4.002 1.60"
+      - "table": league-table format with team names glued on one line
+        ("SunderlandArsenal") and odds glued on the next ("6.604.101.58")
+      - "legacy": the original simple one-line-per-field betslip paste
+ 
+    This is heuristic text parsing against three specific real-world samples,
+    not a guaranteed-correct scraper for every possible odibets page layout
+    or any future site redesign. If a paste doesn't match any of the three
+    known shapes it falls back to "legacy". Spot-check the parsed fixture
+    list against your source before trusting an accumulator built from it,
+    especially for team-name splits in the "table" format (see
+    _split_glued_two_names for why that one's a heuristic guess).
+    """
+ 
     @staticmethod
-    def parse_fixtures_in_order(raw_text: str) -> List[Dict[str, Any]]:
+    def detect_format(raw_text: str) -> str:
+        if re.search(r'\bID:\s*\d+', raw_text) and re.search(r'\bdraw\b', raw_text, re.I):
+            return "detail_dump"
+        if re.search(r'\]\(https?://', raw_text) and re.search(r'\b1\s*\d+\.\d{2}\s*X', raw_text, re.I):
+            return "card"
+        if '\u2022' in raw_text and re.search(r'markets?', raw_text, re.I):
+            return "table"
+        return "legacy"
+ 
+    @staticmethod
+    def _split_glued_two_names(s: str):
+        """
+        Heuristic split for two team names concatenated with no separator,
+        e.g. 'SunderlandArsenal' -> ('Sunderland', 'Arsenal'). Splits at the
+        first lowercase->uppercase letter transition, since a multi-word team
+        name keeps its own internal space ('Real Madrid') while the actual
+        join point between two names never has a space. This can misfire on
+        unusual names (an all-caps abbreviation glued directly to the next
+        name, e.g. 'PSGLyon', has no lowercase->uppercase boundary at all and
+        will fail to split) -- treat mis-splits as a parsing artifact to spot
+        check, not a data error.
+        """
+        boundaries = [m.start() for m in re.finditer(r'(?<=[a-z])(?=[A-Z])', s)]
+        if not boundaries:
+            return None
+        b = boundaries[0]
+        t1, t2 = s[:b].strip(), s[b:].strip()
+        if len(t1) > 2 and len(t2) > 2:
+            return t1, t2
+        return None
+ 
+    @staticmethod
+    def _parse_legacy_format(raw_text: str) -> List[Dict[str, Any]]:
+        """Original parser: one plain betslip paste, one field per line."""
         raw_lines = [l.strip() for l in raw_text.split('\n') if l.strip()]
-
+ 
         sanitized = []
         for l in raw_lines:
             if re.search(r'(odibets|sportpesa|betika|mozzart|Dashboard|Netflix|YouTube|PayPal|Gmail|SafariTour|Inbox|Ask Gemini)', l, re.I):
@@ -200,12 +266,12 @@ class IngestionAgent:
             if re.match(r'^(1|X|2|1X|X2|12|HOME|DRAW|AWAY)$', l, re.I):
                 continue
             sanitized.append(l)
-
+ 
         is_odd_regex = re.compile(r'^\d+(\.\d{1,2})?$')
         matches = []
         pending_teams: List[str] = []
         pending_odds: List[float] = []
-
+ 
         for item in sanitized:
             if is_odd_regex.match(item) and 1.05 <= float(item) <= 45.0:
                 pending_odds.append(float(item))
@@ -228,9 +294,164 @@ class IngestionAgent:
             else:
                 if not item.isdigit() and len(item) > 2:
                     pending_teams.append(item)
-
+ 
         return matches
-
+ 
+    @staticmethod
+    def _parse_card_format(raw_text: str) -> List[Dict[str, Any]]:
+        """
+        odibets search-tile paste: each team name is its own markdown link
+        line, e.g. '[Sunderland AFC](https://...)', and the 1/X/2 odds arrive
+        glued onto a single line with no separators between a value and the
+        next label, e.g. '1 6.40X 4.002 1.60' (meaning 1=6.40, X=4.00, 2=1.60
+        -- the '2' of '4.002' is the away-win label, not part of the draw odd;
+        matching the fractional part to exactly 2 digits is what keeps that
+        boundary correct).
+        """
+        link_re = re.compile(r'^\[(.*?)\]\(https?://\S+\)$')
+        glued_odds_re = re.compile(r'1\s*(\d+\.\d{2})X\s*(\d+\.\d{2})2\s*(\d+\.\d{2})', re.I)
+ 
+        lines = [l.strip() for l in raw_text.split('\n') if l.strip()]
+        matches: List[Dict[str, Any]] = []
+        pending_teams: List[str] = []
+ 
+        for line in lines:
+            text = line
+            m = link_re.match(line)
+            if m:
+                text = m.group(1).strip()
+            if not text:
+                continue
+            if re.search(r'\bhot\b', text, re.I) and len(text) < 15:
+                continue
+            if re.search(r'bet now', text, re.I):
+                continue
+            if re.match(r'^\d{1,2}[\/\.]\d{1,2}(?:\/\d{2,4})?(\s*,\s*|\s*-\s*|\s+)\d{1,2}:\d{2}', text, re.I):
+                continue
+            if re.match(r'^starts in', text, re.I):
+                continue
+            if '\u2022' in text or re.match(r'^[\w .\-]+/[\w .\-]+\(\d+\)$', text):
+                continue  # league header, e.g. "England / Premier League (1)"
+ 
+            odds_m = glued_odds_re.search(text)
+            if odds_m:
+                if len(pending_teams) >= 2:
+                    t1, t2 = pending_teams[-2], pending_teams[-1]
+                    matches.append({
+                        "sequence_order": len(matches) + 1,
+                        "home_team": t1,
+                        "away_team": t2,
+                        "oH": float(odds_m.group(1)),
+                        "oD": float(odds_m.group(2)),
+                        "oA": float(odds_m.group(3)),
+                    })
+                pending_teams = []
+                continue
+ 
+            if len(re.findall(r'[a-zA-Z]', text)) >= 3 and len(text) > 2:
+                pending_teams.append(text)
+ 
+        return matches
+ 
+    @staticmethod
+    def _parse_table_format(raw_text: str) -> List[Dict[str, Any]]:
+        """
+        odibets league-table paste: team names glued on one line
+        ('SunderlandArsenal'), the three 1X2 odds glued on the next
+        ('6.604.101.58'), with league headers ('England \u2022 Premier League')
+        and '+N Markets' trailer lines as noise around them.
+        """
+        glued_odds_full_re = re.compile(r'^(?:\d+\.\d{2}){3}$')
+        markets_trailer_re = re.compile(r'^\+?\d+\s*markets?$', re.I)
+ 
+        lines = [l.strip() for l in raw_text.split('\n') if l.strip()]
+        filtered = []
+        for l in lines:
+            if '\u2022' in l:
+                continue
+            if markets_trailer_re.match(l):
+                continue
+            if re.match(r'^\d{1,2}[\/\.]\d{1,2}(?:\/\d{2,4})?(\s*,\s*|\s*-\s*|\s+)\d{1,2}:\d{2}', l, re.I):
+                continue
+            filtered.append(l)
+ 
+        matches: List[Dict[str, Any]] = []
+        i = 0
+        while i < len(filtered) - 1:
+            if not glued_odds_full_re.match(filtered[i]) and glued_odds_full_re.match(filtered[i + 1]):
+                split = IngestionAgent._split_glued_two_names(filtered[i])
+                odds_vals = [float(x) for x in re.findall(r'\d+\.\d{2}', filtered[i + 1])]
+                if split and len(odds_vals) == 3:
+                    t1, t2 = split
+                    matches.append({
+                        "sequence_order": len(matches) + 1,
+                        "home_team": t1,
+                        "away_team": t2,
+                        "oH": odds_vals[0],
+                        "oD": odds_vals[1],
+                        "oA": odds_vals[2],
+                    })
+                i += 2
+                continue
+            i += 1
+ 
+        return matches
+ 
+    @staticmethod
+    def _parse_detail_dump_format(raw_text: str) -> List[Dict[str, Any]]:
+        """
+        odibets full match-detail dump. Ignores every market block except
+        3-Way: anchors ONLY on a line that is exactly 'Draw' (never matches
+        the longer 'Draw no bet - Full Time' line elsewhere in the same dump,
+        since this is an exact-equality check, not a substring search) and
+        reads the fixed window around it:
+        [home_team, home_odd, 'Draw', draw_odd, away_team, away_odd].
+        This is what was previously misfiring -- the old parser had no
+        concept of this structure, so fragments like the '3 Way' market
+        header text itself were being swept up as if they were team names.
+        """
+        lines = [l.strip() for l in raw_text.split('\n') if l.strip()]
+        matches: List[Dict[str, Any]] = []
+        for i, line in enumerate(lines):
+            if line.strip().lower() != "draw":
+                continue
+            if i < 2 or i + 3 >= len(lines):
+                continue
+            home_team, home_odd_s = lines[i - 2], lines[i - 1]
+            draw_odd_s, away_team, away_odd_s = lines[i + 1], lines[i + 2], lines[i + 3]
+            try:
+                oH, oD, oA = float(home_odd_s), float(draw_odd_s), float(away_odd_s)
+            except ValueError:
+                continue
+            if not (1.01 <= oH <= 60 and 1.01 <= oD <= 60 and 1.01 <= oA <= 60):
+                continue
+            if len(re.findall(r'[a-zA-Z]', home_team)) < 2 or len(re.findall(r'[a-zA-Z]', away_team)) < 2:
+                continue
+            matches.append({
+                "sequence_order": len(matches) + 1,
+                "home_team": home_team,
+                "away_team": away_team,
+                "oH": oH, "oD": oD, "oA": oA,
+            })
+        return matches
+ 
+    @staticmethod
+    def parse_fixtures_in_order(raw_text: str) -> List[Dict[str, Any]]:
+        fmt = IngestionAgent.detect_format(raw_text)
+        parsers = {
+            "detail_dump": IngestionAgent._parse_detail_dump_format,
+            "card": IngestionAgent._parse_card_format,
+            "table": IngestionAgent._parse_table_format,
+            "legacy": IngestionAgent._parse_legacy_format,
+        }
+        result = parsers[fmt](raw_text)
+        # If the detected format's parser found nothing, don't silently
+        # return zero fixtures -- try the plain legacy parser too, in case
+        # the paste mixes plain lines in with the detected format's noise.
+        if not result and fmt != "legacy":
+            result = IngestionAgent._parse_legacy_format(raw_text)
+        return result
+ 
     @staticmethod
     def extract_text_from_screenshot(image_bytes: bytes) -> str:
         if not OCR_AVAILABLE:
@@ -245,15 +466,15 @@ class IngestionAgent:
             img = img.resize((int(img.width * scale), int(img.height * scale)))
         text = pytesseract.image_to_string(img)
         return text
-
-
+ 
+ 
 # =====================================================================
 # AGENT 2A: UNDERSTAT xG
 # =====================================================================
 class UnderstatAgent:
     _league_cache: Dict[str, Dict[str, Any]] = {}
     _cache_lock = asyncio.Lock()
-
+ 
     @staticmethod
     def _extract_teams_data(html: str) -> Optional[Dict[str, Any]]:
         soup = BeautifulSoup(html, "html.parser")
@@ -269,7 +490,7 @@ class UnderstatAgent:
             except Exception:
                 continue
         return None
-
+ 
     @classmethod
     async def _load_league(cls, league: str, client: httpx.AsyncClient) -> Dict[str, Any]:
         async with cls._cache_lock:
@@ -300,7 +521,7 @@ class UnderstatAgent:
         async with cls._cache_lock:
             cls._league_cache[league] = result
         return result
-
+ 
     @classmethod
     async def fetch_team_xg_pair(cls, home_team: str, away_team: str, client: httpx.AsyncClient) -> Optional[Dict[str, float]]:
         for league in UNDERSTAT_LEAGUES:
@@ -322,13 +543,13 @@ class UnderstatAgent:
                     "match_names": {"home": home_match[0], "away": away_match[0]},
                 }
         return None
-
-
+ 
+ 
 # =====================================================================
 # AGENT 2: LIVE DATA HARVESTER
 # =====================================================================
 class LiveDataAgent:
-
+ 
     @staticmethod
     async def fetch_clubelo(team_name: str, client: httpx.AsyncClient) -> Optional[int]:
         clean_team = re.sub(r'\s+(FC|CF|SC|HSC|MFC|98|04|05)$', '', team_name, flags=re.I).replace(" ", "")
@@ -343,7 +564,7 @@ class LiveDataAgent:
         except Exception:
             pass
         return None
-
+ 
     @staticmethod
     async def find_team_id(team_name: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
         if not API_FOOTBALL_KEY:
@@ -371,7 +592,7 @@ class LiveDataAgent:
                     "lat": venue.get("latitude"), "lon": venue.get("longitude")}
         except Exception:
             return None
-
+ 
     @staticmethod
     async def fetch_injuries(team_id: int, client: httpx.AsyncClient) -> Optional[List[str]]:
         if not API_FOOTBALL_KEY or not team_id:
@@ -387,7 +608,7 @@ class LiveDataAgent:
             return [f"{p['player']['name']} ({p['player']['reason']})" for p in data[:8]]
         except Exception:
             return None
-
+ 
     @staticmethod
     async def fetch_form(team_id: int, client: httpx.AsyncClient) -> Optional[str]:
         if not API_FOOTBALL_KEY or not team_id:
@@ -415,7 +636,7 @@ class LiveDataAgent:
             return "".join(letters)
         except Exception:
             return None
-
+ 
     @staticmethod
     async def fetch_h2h(team1_id: int, team2_id: int, client: httpx.AsyncClient) -> Optional[List[str]]:
         if not API_FOOTBALL_KEY or not team1_id or not team2_id:
@@ -436,7 +657,7 @@ class LiveDataAgent:
             return out
         except Exception:
             return None
-
+ 
     @staticmethod
     async def fetch_weather(lat: Optional[float], lon: Optional[float], client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
         if lat is None or lon is None:
@@ -457,12 +678,12 @@ class LiveDataAgent:
             }
         except Exception:
             return None
-
+ 
     @staticmethod
     async def fetch_bookmaker_consensus(home_team: str, away_team: str, client: httpx.AsyncClient) -> Optional[Dict[str, float]]:
         if not ODDS_API_KEY:
             return None
-
+ 
         async def search_league(league_key: str) -> Optional[Dict[str, float]]:
             try:
                 res = await client.get(
@@ -475,7 +696,7 @@ class LiveDataAgent:
                 events = res.json()
                 if not isinstance(events, list):
                     return None
-
+ 
                 best_event, best_score = None, 0
                 for ev in events:
                     score = (fuzz.token_sort_ratio(home_team, ev.get("home_team", "")) +
@@ -484,7 +705,7 @@ class LiveDataAgent:
                         best_score, best_event = score, ev
                 if not best_event or best_score < FUZZY_MATCH_MIN_SCORE:
                     return None
-
+ 
                 h_probs, d_probs, a_probs = [], [], []
                 real_home, real_away = best_event["home_team"], best_event["away_team"]
                 for bk in best_event.get("bookmakers", []):
@@ -510,39 +731,39 @@ class LiveDataAgent:
                 }
             except Exception:
                 return None
-
+ 
         results = await asyncio.gather(*[search_league(lk) for lk in ODDS_API_SOCCER_LEAGUES])
         for r in results:
             if r:
                 return r
         return None
-
+ 
     @classmethod
     async def harvest_all(cls, home_team: str, away_team: str, client: httpx.AsyncClient) -> Dict[str, Any]:
         home_norm = normalize_team_name(home_team)
         away_norm = normalize_team_name(away_team)
-
+ 
         elo_h_task = cls.fetch_clubelo(home_team, client)
         elo_a_task = cls.fetch_clubelo(away_team, client)
         home_id_task = cls.find_team_id(home_norm, client)
         away_id_task = cls.find_team_id(away_norm, client)
         consensus_task = cls.fetch_bookmaker_consensus(home_norm, away_norm, client)
         xg_task = UnderstatAgent.fetch_team_xg_pair(home_norm, away_norm, client)
-
+ 
         elo_h, elo_a, home_info, away_info, consensus, xg_pair = await asyncio.gather(
             elo_h_task, elo_a_task, home_id_task, away_id_task, consensus_task, xg_task
         )
-
+ 
         provenance = {
             "elo_home": "clubelo_live" if elo_h else "default_1500_fallback",
             "elo_away": "clubelo_live" if elo_a else "default_1500_fallback",
         }
         elo_h = elo_h if elo_h else 1500
         elo_a = elo_a if elo_a else 1500
-
+ 
         home_id = home_info["id"] if home_info else None
         away_id = away_info["id"] if away_info else None
-
+ 
         injuries_h_task = cls.fetch_injuries(home_id, client) if home_id else asyncio.sleep(0, result=None)
         injuries_a_task = cls.fetch_injuries(away_id, client) if away_id else asyncio.sleep(0, result=None)
         form_h_task = cls.fetch_form(home_id, client) if home_id else asyncio.sleep(0, result=None)
@@ -552,11 +773,11 @@ class LiveDataAgent:
             cls.fetch_weather(home_info["lat"], home_info["lon"], client)
             if (home_info and home_info.get("lat")) else asyncio.sleep(0, result=None)
         )
-
+ 
         injuries_h, injuries_a, form_h, form_a, h2h, weather = await asyncio.gather(
             injuries_h_task, injuries_a_task, form_h_task, form_a_task, h2h_task, weather_task
         )
-
+ 
         # v2026.5 FIX: normalize nullable *list* fields to [] instead of None.
         # This does not change what's real vs. fallback — data_provenance below
         # still says exactly that — it only changes "no data" from null to an
@@ -572,11 +793,11 @@ class LiveDataAgent:
         consensus = consensus if consensus is not None else {}
         form_h = form_h if form_h is not None else ""
         form_a = form_a if form_a is not None else ""
-
+ 
         elo_diff = (elo_h + 84) - elo_a
         p_home_elo = 1.0 / (1.0 + 10.0 ** (-elo_diff / 400.0))
         p_away_elo = 1.0 - p_home_elo
-
+ 
         if xg_pair:
             lam = round(max(0.35, 0.85 * xg_pair["home_xg_for"] + 0.15 * (1.35 + elo_diff / 500.0)), 2)
             mu = round(max(0.35, 0.85 * xg_pair["away_xg_for"] + 0.15 * (1.20 - elo_diff / 500.0)), 2)
@@ -585,7 +806,7 @@ class LiveDataAgent:
             lam = round(max(0.35, 1.35 + (elo_diff / 500.0)), 2)
             mu = round(max(0.35, 1.20 - (elo_diff / 500.0)), 2)
             xg_source = "unavailable_elo_proxy_used"
-
+ 
         provenance.update({
             "injuries": "api_football_live" if API_FOOTBALL_KEY else "unavailable_no_api_key",
             "form": "api_football_live" if API_FOOTBALL_KEY else "unavailable_no_api_key",
@@ -594,7 +815,7 @@ class LiveDataAgent:
             "bookmaker_consensus": "the_odds_api_live" if consensus else "unavailable_no_api_key_or_no_match_found",
             "expected_goals_lambda_mu": xg_source,
         })
-
+ 
         return {
             "lambda_home": lam,
             "mu_away": mu,
@@ -609,8 +830,8 @@ class LiveDataAgent:
             "understat_xg": xg_pair,
             "data_provenance": provenance,
         }
-
-
+ 
+ 
 # =====================================================================
 # AGENT 3: QUANTITATIVE ENSEMBLE (Dixon-Coles + Shin 1993)
 # =====================================================================
@@ -619,13 +840,13 @@ class QuantEnsembleAgent:
     def solve_shin_debiasing(oH: float, oD: float, oA: float) -> Dict[str, float]:
         pi_h, pi_d, pi_a = 1.0 / oH, 1.0 / oD, 1.0 / oA
         beta = pi_h + pi_d + pi_a
-
+ 
         def probs_at(z: float):
             sh = (np.sqrt(z ** 2 + 4 * (1 - z) * (pi_h ** 2 / beta)) - z) / (2 * (1 - z))
             sd = (np.sqrt(z ** 2 + 4 * (1 - z) * (pi_d ** 2 / beta)) - z) / (2 * (1 - z))
             sa = (np.sqrt(z ** 2 + 4 * (1 - z) * (pi_a ** 2 / beta)) - z) / (2 * (1 - z))
             return sh, sd, sa
-
+ 
         low, high, z = 0.0, 0.999, 0.02
         for _ in range(60):
             z = (low + high) / 2.0
@@ -634,11 +855,11 @@ class QuantEnsembleAgent:
                 low = z
             else:
                 high = z
-
+ 
         sh, sd, sa = probs_at(z)
         tot = sh + sd + sa
         return {"pH": sh / tot, "pD": sd / tot, "pA": sa / tot, "z": round(float(z), 4)}
-
+ 
     @staticmethod
     def solve_dixon_coles(lam: float, mu: float, rho: float = -0.11) -> Dict[str, float]:
         max_g = 9
@@ -662,7 +883,7 @@ class QuantEnsembleAgent:
             "p_draw": float(np.sum(np.diag(matrix))),
             "p_away": float(np.sum(np.triu(matrix, 1))),
         }
-
+ 
     @staticmethod
     def compute_ensemble_weights(dc_is_real: bool, elo_is_real: bool, has_consensus: bool) -> Dict[str, float]:
         """
@@ -675,7 +896,7 @@ class QuantEnsembleAgent:
         no-consensus case that's 0.45 + 0.20 = 0.65 of the ensemble on pure
         noise, while Shin (always real — it's de-vigged straight from the
         odds you supplied) was stuck at 0.35.
-
+ 
         Fix: discount dc/elo weight in proportion to how real their inputs
         are for this specific match, and hand whatever gets discounted to
         Shin. This is a heuristic, not a proven calibration.
@@ -684,7 +905,7 @@ class QuantEnsembleAgent:
             w = {"dc": 0.35, "shin": 0.25, "elo": 0.15, "cons": 0.25}
         else:
             w = {"dc": 0.45, "shin": 0.35, "elo": 0.20, "cons": 0.0}
-
+ 
         discount = 0.0
         if not elo_is_real:
             discount += w["elo"]
@@ -695,11 +916,11 @@ class QuantEnsembleAgent:
             factor = 1.0 if not elo_is_real else 0.6
             discount += w["dc"] * factor
             w["dc"] *= (1.0 - factor)
-
+ 
         w["shin"] += discount
         return w
-
-
+ 
+ 
 # =====================================================================
 # AGENT 4: ACCA BUILDER
 # =====================================================================
@@ -709,17 +930,17 @@ class AccaMaximizerAgent:
                                 leg_size: int = 3, bankroll: float = 5000.0):
         safe_pool = [m for m in matches if m.get("ultra_safe")]
         safe_pool = sorted(safe_pool, key=lambda m: m['model_prob'], reverse=True)
-
+ 
         slips = []
         used_ids = set()
-
+ 
         while True:
             available = [m for m in safe_pool if m['id'] not in used_ids]
             if len(available) < leg_size:
                 break
-
+ 
             best_combo, best_metric = None, -1.0
-
+ 
             def search(start_idx, legs, cum_odds, cum_prob):
                 nonlocal best_combo, best_metric
                 if len(legs) == leg_size:
@@ -732,22 +953,22 @@ class AccaMaximizerAgent:
                 for i in range(start_idx, len(available)):
                     m = available[i]
                     search(i + 1, legs + [m], cum_odds * m['market_odd'], cum_prob * m['model_prob'])
-
+ 
             search(0, [], 1.0, 1.0)
-
+ 
             if not best_combo:
                 break
-
+ 
             for m in best_combo:
                 used_ids.add(m['id'])
-
+ 
             c_odds = float(np.prod([m['market_odd'] for m in best_combo]))
             c_prob = float(np.prod([m['model_prob'] for m in best_combo]))
-
+ 
             b = max(0.01, c_odds - 1.0)
             kelly = max(0.0, (b * c_prob - (1.0 - c_prob)) / b)
             stake = max(0, round((bankroll * (kelly * 0.25)) / 10) * 10)
-
+ 
             slips.append({
                 "slip_id": len(slips) + 1,
                 "legs": best_combo,
@@ -757,10 +978,10 @@ class AccaMaximizerAgent:
                 "recommended_stake": stake,
                 "note": "Built only from legs meeting the ultra-safe filter (see /health for criteria).",
             })
-
+ 
         return slips
-
-
+ 
+ 
 # =====================================================================
 # API ENDPOINTS
 # =====================================================================
@@ -769,31 +990,31 @@ class PipelineRequest(BaseModel):
     target_min_odds: float = 3.00
     legs_per_slip: int = 3
     bankroll: float = 5000.0
-
-
+ 
+ 
 def _apply_ultra_safe_filter(m: Dict[str, Any]) -> bool:
     if m['model_prob'] < ULTRA_SAFE_PROB_FLOOR:
         return False
-
+ 
     market_implied = 1.0 / m['market_odd']
     edge = m['model_prob'] - market_implied
     if edge > ULTRA_SAFE_MAX_MARKET_DISAGREEMENT:
         return False
-
+ 
     injuries = m['tactical_data'].get('key_injuries_on_favored_side')
     if injuries:
         return False
-
+ 
     consensus = m.get('bookmaker_consensus')
     if consensus:
         pick = m['consensus_pick']
         cons_key = {"1": "consensus_pH", "X": "consensus_pD", "2": "consensus_pA"}[pick]
         if abs(consensus[cons_key] - m['model_prob']) > CONSENSUS_OUTLIER_THRESHOLD:
             return False
-
+ 
     return True
-
-
+ 
+ 
 @app.get("/health")
 def health_check():
     agent_names = [
@@ -822,28 +1043,28 @@ def health_check():
             "requires_no_key_injuries": True,
         },
     }
-
-
+ 
+ 
 @app.post("/api/v2/execute_pipeline")
 async def execute_pipeline(req: PipelineRequest):
     raw_matches = IngestionAgent.parse_fixtures_in_order(req.raw_text)
     if not raw_matches:
         raise HTTPException(status_code=422, detail="No valid fixtures parsed. Ensure teams and odds are present.")
-
+ 
     analyzed_roster = []
-
+ 
     async with httpx.AsyncClient() as client:
         for rm in raw_matches:
             seq = rm["sequence_order"]
             t1, t2 = rm["home_team"], rm["away_team"]
             oH, oD, oA = rm["oH"], rm["oD"], rm["oA"]
-
+ 
             stats = await LiveDataAgent.harvest_all(t1, t2, client)
-
+ 
             dc = QuantEnsembleAgent.solve_dixon_coles(stats["lambda_home"], stats["mu_away"])
             shin = QuantEnsembleAgent.solve_shin_debiasing(oH, oD, oA)
             consensus = stats.get("bookmaker_consensus")
-
+ 
             # v2026.5 FIX: weights now computed from actual data quality for
             # this match instead of fixed constants. See compute_ensemble_weights.
             dc_is_real = (stats["data_provenance"]["expected_goals_lambda_mu"] == "understat_live")
@@ -852,7 +1073,7 @@ async def execute_pipeline(req: PipelineRequest):
                 and stats["data_provenance"]["elo_away"] == "clubelo_live"
             )
             w = QuantEnsembleAgent.compute_ensemble_weights(dc_is_real, elo_is_real, bool(consensus))
-
+ 
             if consensus:
                 ens_H = (w["dc"] * dc["p_home"] + w["shin"] * shin["pH"] +
                          w["elo"] * stats["elo_probabilities"]["p_home"] + w["cons"] * consensus["consensus_pH"])
@@ -864,10 +1085,10 @@ async def execute_pipeline(req: PipelineRequest):
                 ens_H = w["dc"] * dc["p_home"] + w["shin"] * shin["pH"] + w["elo"] * stats["elo_probabilities"]["p_home"]
                 ens_D = w["dc"] * dc["p_draw"] + w["shin"] * shin["pD"] + w["elo"] * 0.26
                 ens_A = w["dc"] * dc["p_away"] + w["shin"] * shin["pA"] + w["elo"] * stats["elo_probabilities"]["p_away"]
-
+ 
             tot = ens_H + ens_D + ens_A
             ens_H, ens_D, ens_A = round(ens_H / tot, 4), round(ens_D / tot, 4), round(ens_A / tot, 4)
-
+ 
             # v2026.5 FIX: straight argmax, replacing the old 0.40-floor
             # if/elif ladder that forced a Draw pick whenever neither side
             # cleared 40% — even when Draw was the LEAST likely outcome
@@ -877,7 +1098,7 @@ async def execute_pipeline(req: PipelineRequest):
             pick_prob = probs[pick]
             pick_odd = {"1": oH, "X": oD, "2": oA}[pick]
             pick_str = {"1": f"{t1} Win (1)", "X": "Draw (X)", "2": f"{t2} Win (2)"}[pick]
-
+ 
             # v2026.5 FIX: always a list (never null) so a frontend forEach
             # on this field can't crash — empty means "no flagged injury",
             # not "unchecked" (unchecked is tracked separately in provenance).
@@ -887,7 +1108,7 @@ async def execute_pipeline(req: PipelineRequest):
                 key_injury_flag = stats["team_news"]["away_injuries"]
             else:
                 key_injury_flag = []
-
+ 
             match_record = {
                 "id": seq,
                 "order": seq,
@@ -920,11 +1141,11 @@ async def execute_pipeline(req: PipelineRequest):
             }
             match_record["ultra_safe"] = _apply_ultra_safe_filter(match_record)
             analyzed_roster.append(match_record)
-
+ 
     accas = AccaMaximizerAgent.build_ultra_safe_accas(
         analyzed_roster, req.target_min_odds, req.legs_per_slip, req.bankroll
     )
-
+ 
     return {
         "status": "success",
         "matches_count": len(analyzed_roster),
@@ -936,8 +1157,8 @@ async def execute_pipeline(req: PipelineRequest):
         "accumulators": accas,                    # ALIAS
         "accas": accas,                           # ALIAS
     }
-
-
+ 
+ 
 @app.post("/api/v2/execute_pipeline_from_screenshot")
 async def execute_pipeline_from_screenshot(
     file: UploadFile = File(...),
@@ -954,8 +1175,8 @@ async def execute_pipeline_from_screenshot(
         bankroll=bankroll,
     )
     return await execute_pipeline(req)
-
-
+ 
+ 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
