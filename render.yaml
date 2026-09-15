@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: dixon-coles-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: LEAGUE
+        value: E0
+      - key: SEASONS
+        value: "2526,2425,2324"
+      - key: ALLOWED_ORIGINS
+        value: "*"
